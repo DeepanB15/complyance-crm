@@ -14,6 +14,15 @@ app.include_router(sync_router)
 app.include_router(logs_router)
 
 
+@app.get("/")
+def root():
+    return {
+        "message": "Complyance CRM-Zoho Integration API",
+        "service": "crm-zoho-integration",
+        "status": "ok",
+    }
+
+
 @app.get("/health")
 def health():
     return {
