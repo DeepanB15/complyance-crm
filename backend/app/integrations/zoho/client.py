@@ -1,6 +1,12 @@
+import asyncio
+import time
+import uuid
+
 import httpx
 
 from app.core.config import settings
+from app.db.database import SessionLocal
+from app.db.model import IntegrationLog
 from app.integrations.zoho.auth import zoho_auth
 
 
@@ -12,6 +18,9 @@ class ZohoClient:
         endpoint: str,
         **kwargs,
     ):
+        start_time = time.time()
+        event_id = str(uuid.uuid4())
+
         access_token = await zoho_auth.get_access_token()
 
         url = f"{settings.zoho_api_url}{endpoint}"
@@ -22,26 +31,125 @@ class ZohoClient:
         params = kwargs.pop("params", {})
         params["organization_id"] = settings.zoho_organization_id
 
-        async with httpx.AsyncClient() as client:
-            response = await client.request(
-                method,
-                url,
-                headers=headers,
-                params=params,
-                **kwargs,
-            )
+        request_body = kwargs.get("json", {})
 
-        # Debug information for Zoho API responses
-        print("ZOHO API STATUS:", response.status_code)
-        print("ZOHO API RESPONSE:", response.text)
+        response = None
+        error_message = None
+        status = "failed"
 
-        # Do not hide Zoho's actual error message
-        if response.status_code >= 400:
+        try:
+            # Retry transient failures and rate limits
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(
+                        timeout=30.0
+                    ) as client:
+
+                        response = await client.request(
+                            method,
+                            url,
+                            headers=headers,
+                            params=params,
+                            **kwargs,
+                        )
+
+                    # Rate limit / temporary server errors
+                    if response.status_code in {
+                        429,
+                        500,
+                        502,
+                        503,
+                        504,
+                    }:
+
+                        if attempt < 2:
+
+                            retry_after = response.headers.get(
+                                "Retry-After"
+                            )
+
+                            if retry_after:
+                                try:
+                                    delay = float(retry_after)
+                                except ValueError:
+                                    delay = 2 ** attempt
+                            else:
+                                delay = 2 ** attempt
+
+                            await asyncio.sleep(delay)
+                            continue
+
+                    # Permanent API error
+                    if response.status_code >= 400:
+                        raise RuntimeError(
+                            f"Zoho API error "
+                            f"{response.status_code}: "
+                            f"{response.text}"
+                        )
+
+                    status = "success"
+
+                    return response.json()
+
+                except (
+                    httpx.TimeoutException,
+                    httpx.NetworkError,
+                ) as exc:
+
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+
+                    raise exc
+
             raise RuntimeError(
-                f"Zoho API error {response.status_code}: {response.text}"
+                "Zoho API request failed after 3 attempts"
             )
 
-        return response.json()
+        except Exception as exc:
+            error_message = str(exc)
+            raise
+
+        finally:
+            # Record integration log
+            duration_ms = int(
+                (time.time() - start_time) * 1000
+            )
+
+            try:
+                db = SessionLocal()
+
+                log = IntegrationLog(
+                    event_id=event_id,
+                    system="zoho",
+                    operation=f"{method} {endpoint}",
+                    method=method,
+                    endpoint=endpoint,
+                    status_code=(
+                        response.status_code
+                        if response is not None
+                        else None
+                    ),
+                    status=status,
+                    request_summary=str(request_body)[:1000],
+                    response_summary=(
+                        response.text[:1000]
+                        if response is not None
+                        else None
+                    ),
+                    error_message=error_message,
+                    duration_ms=duration_ms,
+                )
+
+                db.add(log)
+                db.commit()
+                db.close()
+
+            except Exception as log_error:
+                print(
+                    "Failed to save integration log:",
+                    log_error,
+                )
 
     async def get_organizations(self):
         return await self.request(
@@ -83,17 +191,11 @@ class ZohoClient:
         if phone:
             payload["phone"] = phone
 
-        print("ZOHO CREATE CUSTOMER PAYLOAD:", payload)
-
-        result = await self.request(
+        return await self.request(
             "POST",
             "/contacts",
             json=payload,
         )
-
-        print("ZOHO CREATE CUSTOMER RESPONSE:", result)
-
-        return result
 
     async def list_items(self):
         return await self.request(

@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from app.db.model import Deal, SalesOrder, Invoice
+from app.db.model import Deal, SalesOrder, Invoice, Payment
 from app.integrations.zoho.service import zoho_service
 
 
@@ -10,8 +10,7 @@ async def process_closed_won_deal(
     db: Session,
     deal: Deal,
 ):
-    # 0. Idempotency:
-    # If this deal was already processed, return the existing Sales Order.
+    # Idempotency
     existing_order = (
         db.query(SalesOrder)
         .filter(SalesOrder.deal_id == deal.id)
@@ -68,12 +67,14 @@ async def process_closed_won_deal(
     db.add(sales_order)
     db.flush()
 
-    # 3. Create three milestone invoices: 50 / 30 / 20
+    # 3. Create milestone invoices
     milestones = [
         Decimal("50"),
         Decimal("30"),
         Decimal("20"),
     ]
+
+    created_invoices = []
 
     for percentage in milestones:
         milestone_amount = (
@@ -102,6 +103,32 @@ async def process_closed_won_deal(
         )
 
         db.add(invoice)
+        created_invoices.append(invoice)
+
+    db.flush()
+
+    # 4. Record first milestone payment
+    first_invoice = created_invoices[0]
+
+    payment_result = await zoho_service.record_payment(
+        customer_id=zoho_customer_id,
+        invoice_id=first_invoice.zoho_invoice_id,
+        amount=first_invoice.total,
+    )
+
+    zoho_payment = payment_result.get("payment", {})
+
+    payment = Payment(
+        zoho_payment_id=zoho_payment.get("payment_id"),
+        invoice_id=first_invoice.id,
+        amount=first_invoice.total,
+        currency=deal.currency or "INR",
+    )
+
+    db.add(payment)
+
+    first_invoice.amount_paid = first_invoice.total
+    first_invoice.status = "paid"
 
     db.commit()
 
